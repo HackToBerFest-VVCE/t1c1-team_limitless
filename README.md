@@ -1,2 +1,2 @@
-# t1c1-visionx
-Private hackathon repository for VISIONX
+# t1c1-limitless
+Private hackathon repository for Team limitless
