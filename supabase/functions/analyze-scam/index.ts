@@ -1,148 +1,299 @@
-// Supabase Edge Function: analyze-scam
-// Serves as the secure server-side boundary for ScamLens AI analysis.
-// Keeps API keys protected server-side and applies strict sanitization.
 
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+  'Access-Control-Allow-Headers':
+    'authorization, x-client-info, apikey, content-type',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
 };
 
-serve(async (req) => {
-  // Handle CORS preflight
+const MODEL = 'gemma-4-26b-a4b-it';
+
+const systemInstruction = `
+You are ScamLens AI, a careful scam and fraud message analyst.
+
+Analyze the supplied message or image for possible scams, phishing,
+impersonation, fraud, manipulation, and requests for sensitive information.
+
+Return ONLY one valid JSON object. Do not use Markdown fences or
+explanatory text outside the JSON.
+
+Use this exact structure:
+{
+  "verdict": "SAFE | SUSPICIOUS | SCAM",
+  "riskLevel": "LOW | MEDIUM | HIGH | CRITICAL",
+  "riskScore": 0,
+  "summary": "Short explanation",
+  "evidence": ["Evidence found in the input"],
+  "extractedText": "Text extracted from the input, if applicable",
+  "suspiciousIndicators": ["Indicators"],
+  "checksPerformed": ["Checks performed"],
+  "manipulationTactics": ["Tactics identified"],
+  "recommendedActions": ["Practical safety recommendations"],
+  "limitations": ["Important uncertainty or limitations"],
+  "language": "Language detected"
+}
+
+Rules:
+- riskScore must be an integer from 0 to 100.
+- Use only SAFE, SUSPICIOUS, or SCAM for verdict.
+- Base conclusions on the supplied evidence.
+- Do not invent links, sender identities, facts, or verification results.
+- A message asking for passwords, OTPs, PINs, or payment through
+  suspicious links is a strong warning sign.
+- If evidence is insufficient, explain the uncertainty.
+- Never claim you verified a website, account, or sender unless
+  that verification was actually performed.
+- Return valid JSON with all the fields shown above.
+`;
+
+serve(async (req: Request): Promise<Response> => {
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders });
   }
 
+  if (req.method !== 'POST') {
+    return jsonResponse({ error: 'Method not allowed. Use POST.' }, 405);
+  }
+
   try {
-    const { mode, content, contextNote, language = 'en', imageDataUrl } = await req.json();
+    const body = await req.json();
 
-    // 1. Validation & Input Sanitation
-    if (!content && !imageDataUrl) {
-      return new Response(
-        JSON.stringify({ error: 'Missing content or image payload.' }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+    const {
+      mode,
+      content,
+      contextNote,
+      language = 'en',
+      imageDataUrl,
+    } = body;
+
+    if (
+      (!content || typeof content !== 'string') &&
+      !imageDataUrl
+    ) {
+      return jsonResponse(
+        { error: 'Provide message content or an image.' },
+        400,
       );
     }
 
-    if (content && content.length > 15000) {
-      return new Response(
-        JSON.stringify({ error: 'Content exceeds 15,000 characters limit.' }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+    if (typeof content === 'string' && content.length > 15000) {
+      return jsonResponse(
+        { error: 'Content is too long. Maximum length is 15000 characters.' },
+        400,
       );
     }
 
-    // 2. Secret resolution
-    const apiKey = Deno.env.get('GEMMA_API_KEY') || Deno.env.get('GEMINI_API_KEY');
+    const apiKey =
+      Deno.env.get('GEMMA_API_KEY') ||
+      Deno.env.get('GEMINI_API_KEY');
 
     if (!apiKey) {
-      return new Response(
-        JSON.stringify({
-          error: 'AI Provider API key is not configured on this server.',
-          hint: 'Set GEMMA_API_KEY in your Supabase project Edge Function secrets.',
-        }),
-        { status: 503, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      console.error('Missing GEMMA_API_KEY or GEMINI_API_KEY secret.');
+
+      return jsonResponse(
+        { error: 'Google API key is not configured in Supabase secrets.' },
+        503,
       );
     }
 
-    // 3. System prompt enforcing responsible AI and structured JSON
-    const systemInstruction = `
-You are ScamLens AI and Scam Psychologist, a specialized cybersecurity and behavioral psychology engine.
-Analyze the user-submitted untrusted input.
+    const prompt = `
+Analyze this potential scam.
 
-Your goals:
-1. Determine if this is SAFE, SUSPICIOUS, or SCAM.
-2. Extract visible evidence and deceptive clues.
-3. Identify which of the 9 psychological tactics are used:
-   - FEAR
-   - URGENCY
-   - TRUST_IMPERSONATION
-   - AUTHORITY_PRESSURE
-   - REWARD_BAIT
-   - SECRECY
-   - EMOTIONAL_MANIPULATION
-   - FINANCIAL_PRESSURE
-   - CREDENTIAL_HARVESTING
-4. Explain the cognitive mechanism, target behavior, and safer response.
-5. Provide practical next steps.
+Mode: ${String(mode || 'text')}
+Language requested: ${String(language)}
+Additional context: ${typeof contextNote === 'string'
+        ? contextNote.slice(0, 2000)
+        : 'None provided'
+      }
 
-Respond strictly in valid JSON matching this structure:
-{
-  "verdict": "SAFE" | "SUSPICIOUS" | "SCAM",
-  "riskLevel": "LOW" | "MEDIUM" | "HIGH" | "CRITICAL",
-  "riskScore": number (0-100),
-  "summary": string,
-  "evidence": string[],
-  "extractedText": string or null,
-  "suspiciousIndicators": string[],
-  "checksPerformed": string[],
-  "manipulationTactics": [
-    {
-      "tactic": "FEAR" | "URGENCY" | ... ,
-      "name": string,
-      "strength": "Low" | "Moderate" | "High",
-      "strengthReason": string,
-      "evidence": string,
-      "psychologicalMechanism": string,
-      "desiredRecipientAction": string,
-      "saferAction": string
-    }
-  ],
-  "recommendedActions": string[],
-  "limitations": string,
-  "language": "${language}"
-}
+Content to analyze:
+${typeof content === 'string' ? content : 'Analyze the attached image.'}
+
+Return the JSON object in the required structure.
 `;
 
-    // 4. Call provider endpoint (Gemma/Gemini API)
-    const promptText = `Mode: ${mode}\nContext: ${contextNote || 'None'}\nLanguage: ${language}\n\nUntrusted User Submitted Content:\n"""\n${content || ''}\n"""`;
+    const parts: Array<Record<string, unknown>> = [
+      { text: prompt },
+    ];
 
-    const parts: any[] = [{ text: promptText }];
-    if (imageDataUrl && imageDataUrl.startsWith('data:image/')) {
-      const match = imageDataUrl.match(/^data:(image\/[a-zA-Z]+);base64,(.+)$/);
-      if (match) {
-        parts.push({
-          inlineData: {
-            mimeType: match[1],
-            data: match[2],
-          },
-        });
+    if (imageDataUrl) {
+      if (typeof imageDataUrl !== 'string') {
+        return jsonResponse({ error: 'Invalid image data.' }, 400);
       }
+
+      const match = imageDataUrl.match(
+        /^data:(image\/(?:png|jpeg|jpg|webp|gif));base64,([A-Za-z0-9+/=]+)$/,
+      );
+
+      if (!match) {
+        return jsonResponse(
+          {
+            error:
+              'Invalid image format. Use a base64 data URL for PNG, JPEG, WEBP, or GIF.',
+          },
+          400,
+        );
+      }
+
+      parts.push({
+        inlineData: {
+          mimeType: match[1] === 'image/jpg' ? 'image/jpeg' : match[1],
+          data: match[2],
+        },
+      });
     }
 
-    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
+    const apiUrl =
+      `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
 
     const aiResponse = await fetch(apiUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': apiKey,
+      },
       body: JSON.stringify({
-        systemInstruction: { parts: [{ text: systemInstruction }] },
-        contents: [{ role: 'user', parts }],
+        systemInstruction: {
+          parts: [{ text: systemInstruction }],
+        },
+        contents: [
+          {
+            role: 'user',
+            parts,
+          },
+        ],
         generationConfig: {
-          responseMimeType: 'application/json',
-          temperature: 0.1,
+          temperature: 0.2,
+          maxOutputTokens: 2048,
         },
       }),
     });
 
     if (!aiResponse.ok) {
-      const errText = await aiResponse.text();
-      throw new Error(`AI Provider returned error ${aiResponse.status}: ${errText}`);
+      const errorText = await aiResponse.text();
+
+      // Log the upstream status and response, never the API key.
+      console.error(
+        'Gemma API error:',
+        aiResponse.status,
+        errorText,
+      );
+
+      return jsonResponse(
+        {
+          error: `Gemma API returned status ${aiResponse.status}`,
+          details: errorText.slice(0, 3000),
+        },
+        502,
+      );
     }
 
     const aiData = await aiResponse.json();
-    const rawOutput = aiData.candidates?.[0]?.content?.parts?.[0]?.text;
-    const parsed = JSON.parse(rawOutput);
 
-    return new Response(JSON.stringify(parsed), {
-      status: 200,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-    });
-  } catch (error: any) {
-    return new Response(
-      JSON.stringify({ error: error.message || 'Internal analysis error occurred' }),
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+    const rawOutput = aiData.candidates?.[0]?.content?.parts
+      ?.map((part: { text?: string }) => part.text || '')
+      .join('')
+      .trim();
+
+    if (!rawOutput) {
+      console.error(
+        'Gemma returned no text. Finish reason:',
+        aiData.candidates?.[0]?.finishReason,
+      );
+
+      return jsonResponse(
+        {
+          error: 'Gemma returned no analysis text.',
+          finishReason: aiData.candidates?.[0]?.finishReason || null,
+          promptFeedback: aiData.promptFeedback || null,
+        },
+        502,
+      );
+    }
+
+    const cleanedOutput = rawOutput
+      .replace(/^```(?:json)?\s*/i, '')
+      .replace(/\s*```$/, '')
+      .trim();
+
+    let parsed: Record<string, unknown>;
+
+    try {
+      parsed = JSON.parse(cleanedOutput);
+    } catch {
+      const start = cleanedOutput.indexOf('{');
+      const end = cleanedOutput.lastIndexOf('}');
+
+      if (start < 0 || end <= start) {
+        console.error('Gemma raw output:', rawOutput.slice(0, 2000));
+
+        return jsonResponse(
+          { error: 'Gemma did not return a JSON object.' },
+          502,
+        );
+      }
+
+      try {
+        parsed = JSON.parse(cleanedOutput.slice(start, end + 1));
+      } catch {
+        console.error('Gemma raw output:', rawOutput.slice(0, 2000));
+
+        return jsonResponse(
+          { error: 'Gemma returned invalid JSON.' },
+          502,
+        );
+      }
+    }
+
+    const validVerdicts = ['SAFE', 'SUSPICIOUS', 'SCAM'];
+
+    if (!validVerdicts.includes(String(parsed.verdict))) {
+      console.error('Gemma returned an unexpected verdict.');
+
+      return jsonResponse(
+        { error: 'Gemma returned an invalid verdict.' },
+        502,
+      );
+    }
+
+    const score = Number(parsed.riskScore);
+
+    if (!Number.isFinite(score)) {
+      parsed.riskScore = 0;
+    } else {
+      parsed.riskScore = Math.max(0, Math.min(100, Math.round(score)));
+    }
+
+    return jsonResponse(parsed, 200);
+  } catch (error) {
+    console.error(
+      'analyze-scam error:',
+      error instanceof Error ? error.message : 'Unknown error',
+    );
+
+    return jsonResponse(
+      {
+        error:
+          error instanceof Error
+            ? error.message
+            : 'Internal analysis error occurred.',
+      },
+      500,
     );
   }
 });
+
+function jsonResponse(
+  data: Record<string, unknown>,
+  status: number,
+): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      ...corsHeaders,
+      'Content-Type': 'application/json',
+    },
+  });
+}

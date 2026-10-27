@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
 import { UserProfile } from '../types';
 import { supabase, isSupabaseConfigured } from '../lib/supabase';
+import { fetchProfile } from '../lib/profileService';
 
 interface AuthContextType {
   user: UserProfile | null;
@@ -32,12 +33,20 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         try {
           const { data } = await supabase.auth.getSession();
           if (data.session?.user && mounted) {
+            const authUser = data.session.user;
+            // Prefer display_name from public.profiles (set by DB trigger on signup)
+            const profile = await fetchProfile(authUser.id);
+            const displayName =
+              profile?.display_name ||
+              authUser.user_metadata?.displayName ||
+              authUser.email?.split('@')[0] ||
+              'User';
             setUser({
-              id: data.session.user.id,
-              email: data.session.user.email || '',
-              displayName: data.session.user.user_metadata?.displayName || data.session.user.email?.split('@')[0] || 'User',
+              id: authUser.id,
+              email: authUser.email || '',
+              displayName,
               isDemoUser: false,
-              created_at: data.session.user.created_at,
+              created_at: authUser.created_at,
             });
             setIsLoading(false);
             return;
@@ -68,12 +77,20 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     // Listen to Supabase auth state change if configured
     let subscription: { unsubscribe: () => void } | null = null;
     if (isSupabaseConfigured && supabase) {
-      const { data } = supabase.auth.onAuthStateChange((_event, session) => {
+      const { data } = supabase.auth.onAuthStateChange(async (_event, session) => {
         if (session?.user) {
+          const authUser = session.user;
+          // Fetch profile for display_name — don't block the auth state update
+          const profile = await fetchProfile(authUser.id);
+          const displayName =
+            profile?.display_name ||
+            authUser.user_metadata?.displayName ||
+            authUser.email?.split('@')[0] ||
+            'User';
           setUser({
-            id: session.user.id,
-            email: session.user.email || '',
-            displayName: session.user.user_metadata?.displayName || session.user.email?.split('@')[0] || 'User',
+            id: authUser.id,
+            email: authUser.email || '',
+            displayName,
             isDemoUser: false,
           });
         } else if (!localStorage.getItem(DEMO_USER_KEY)) {

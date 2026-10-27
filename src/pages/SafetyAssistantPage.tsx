@@ -6,8 +6,10 @@ import { VerdictBadge } from '../components/VerdictBadge';
 import { PsychologyBreakdown } from '../components/PsychologyBreakdown';
 import { analyzeScamContent } from '../lib/aiAnalysisService';
 import { saveLocalHistory } from '../lib/supabase';
+import { saveScanToSupabase } from '../lib/historyService';
 import { AnalysisMode, AnalysisResult } from '../types';
 import { useLanguage } from '../context/LanguageContext';
+import { useAuth } from '../context/AuthContext';
 import {
   ShieldAlert,
   MessageSquare,
@@ -27,6 +29,7 @@ import {
 export const SafetyAssistantPage: React.FC = () => {
   const location = useLocation();
   const { t, language } = useLanguage();
+  const { user, isDemoUser } = useAuth();
 
   const [mode, setMode] = useState<AnalysisMode>('message');
   const [content, setContent] = useState('');
@@ -69,13 +72,24 @@ export const SafetyAssistantPage: React.FC = () => {
 
       setResult(res);
 
-      // Save to local scan history
+      // Always save to local storage (guest + authenticated fallback)
       saveLocalHistory({
         scan_type: mode.toUpperCase(),
         verdict: res.verdict,
         risk_level: res.riskLevel,
         summary: res.summary,
       });
+
+      // Also save to Supabase cloud for authenticated (non-demo) users
+      if (user && !isDemoUser) {
+        saveScanToSupabase({
+          user_id: user.id,
+          scan_type: mode.toUpperCase(),
+          verdict: res.verdict,
+          risk_level: res.riskLevel,
+          summary: res.summary,
+        });
+      }
     } catch (err: any) {
       setError(err.message || 'Analysis could not be completed.');
     } finally {
